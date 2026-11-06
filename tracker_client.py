@@ -243,7 +243,8 @@ class Client:
             if not segment or distance(segment[-1][0], position) >= 3:
                 segment.append(self.rx)
                 if self.path is not None:
-                    self.path.add_position(position)
+                    self.path.add_position(*position)
+                    self.path.draw()
                 elif len(segment) == 2:
                     self.path = self.map.set_path([fix[0] for fix in segment])
             return
