@@ -46,7 +46,8 @@ void transmitPacket() {
   ++sequence;
 
   const GpsStatus gpsStatus = localGpsStatus();
-  uint8_t payload[kPositionSize];
+  uint8_t payload[kMaxPayloadSize];
+  const size_t baseLength = gpsStatus == Fix ? kPositionSize : kStatusSize;
   writeUint32(payload, sequence);
   payload[4] = gpsStatus;
   if (gpsStatus == Fix) {
@@ -54,22 +55,40 @@ void transmitPacket() {
     writeUint32(payload + 5, (gps.location.lat() + 90.0) * 1000000 + 0.5);
     writeUint32(payload + 9, (gps.location.lng() + 180.0) * 1000000 + 0.5);
   }
-  const int16_t status = radio.transmit(payload, gpsStatus == Fix ? kPositionSize : kStatusSize);
-  if (status == RADIOLIB_ERR_NONE) {
-    char displayStatus[40];
-    snprintf(displayStatus, sizeof(displayStatus), "Sent OK\nGPS %s", gpsLabels[gpsStatus]);
-    showRadioStatus(sequence, displayStatus);
+  const bool sampleFresh = wind.count > 0 &&
+                           time_us_64() / 1000 - wind.sampleMs <= kWindFreshMs;
+  const uint16_t windValue = localWindValid()
+      ? static_cast<uint16_t>(wind.metersPerSecond * 100 + 0.5f) : kMissingWindValue;
+  const uint16_t voltageValue = sampleFresh
+      ? static_cast<uint16_t>(wind.volts * 1000 + 0.5f) : kMissingWindValue;
+  writeUint32(payload + baseLength, uint32_t(windValue) | (uint32_t(voltageValue) << 16));
+  const int16_t status = radio.transmit(payload, baseLength + kWindExtensionSize);
+  lastTxStatus = status;
+  if (Serial && status == RADIOLIB_ERR_NONE) {
     Serial.print("# tx_seq=");
     Serial.print(sequence);
     Serial.print(" gps=");
     Serial.print(gpsLabels[gpsStatus]);
     Serial.print(" chars=");
-    Serial.println(gps.charsProcessed());
-  } else {
-    showRadioStatus(sequence, "TX error", status);
+    Serial.print(gps.charsProcessed());
+    Serial.print(" wind_ms=");
+    if (windValue != kMissingWindValue) {
+      Serial.print(windValue / 100.0f, 2);
+    } else {
+      Serial.print("missing");
+    }
+    Serial.print(" volts=");
+    if (voltageValue != kMissingWindValue) {
+      Serial.print(voltageValue / 1000.0f, 3);
+    } else {
+      Serial.print("missing");
+    }
+    Serial.println();
+  } else if (Serial) {
     Serial.print("# tx_error=");
     Serial.println(status);
   }
+  showWindStatus();
 }
 
 void printPacket(Print& output, uint64_t receivedMs, uint32_t receivedSequence,
@@ -113,6 +132,14 @@ void printPacket(Print& output, uint64_t receivedMs, uint32_t receivedSequence,
   } else {
     output.print(",,");
   }
+  output.print(',');
+  if (receivedWindValid) {
+    output.print(receivedWindMs, 2);
+  }
+  output.print(',');
+  if (receivedVoltageValid) {
+    output.print(receivedWindVolts, 3);
+  }
   output.println();
 }
 
@@ -126,8 +153,11 @@ void receivePacket() {
     return;
   }
 
-  uint8_t payload[kPositionSize];
+  uint8_t payload[kMaxPayloadSize];
   const size_t length = radio.getPacketLength();
+  const bool hasWindExtension = length == kStatusSize + kWindExtensionSize ||
+                                length == kPositionSize + kWindExtensionSize;
+  const size_t baseLength = hasWindExtension ? length - kWindExtensionSize : length;
   const int16_t status = radio.readData(payload, sizeof(payload));
   const float rssi = radio.getRSSI();
   const float snr = radio.getSNR();
@@ -138,7 +168,7 @@ void receivePacket() {
     return;
   }
   if (status != RADIOLIB_ERR_NONE ||
-      (length != kSequenceSize && length != kStatusSize && length != kPositionSize)) {
+      (baseLength != kSequenceSize && baseLength != kStatusSize && baseLength != kPositionSize)) {
     ++invalidPackets;
     return;
   }
@@ -146,7 +176,7 @@ void receivePacket() {
   GpsStatus gpsStatus = Legacy;
   double latitude = 0;
   double longitude = 0;
-  if (length == kPositionSize && payload[4] == Fix) {
+  if (baseLength == kPositionSize && payload[4] == Fix) {
     const uint32_t lat = readUint32(payload + 5);
     const uint32_t lon = readUint32(payload + 9);
     if (lat > 180000000 || lon > 360000000) {
@@ -156,12 +186,28 @@ void receivePacket() {
     gpsStatus = Fix;
     latitude = lat / 1000000.0 - 90.0;
     longitude = lon / 1000000.0 - 180.0;
-  } else if (length == kStatusSize && payload[4] <= NoFix) {
+  } else if (baseLength == kStatusSize && payload[4] <= NoFix) {
     gpsStatus = static_cast<GpsStatus>(payload[4]);
-  } else if (length != kSequenceSize) {
+  } else if (baseLength != kSequenceSize) {
     ++invalidPackets;
     return;
   }
+  uint16_t windValue = kMissingWindValue;
+  uint16_t voltageValue = kMissingWindValue;
+  if (hasWindExtension) {
+    const uint32_t extension = readUint32(payload + baseLength);
+    windValue = extension & 0xFFFF;
+    voltageValue = extension >> 16;
+    if ((voltageValue != kMissingWindValue && voltageValue > 3300) ||
+        (windValue != kMissingWindValue && voltageValue == kMissingWindValue)) {
+      ++invalidPackets;
+      return;
+    }
+  }
+  receivedWindValid = windValue != kMissingWindValue;
+  receivedVoltageValid = voltageValue != kMissingWindValue;
+  receivedWindMs = receivedWindValid ? windValue / 100.0f : 0;
+  receivedWindVolts = receivedVoltageValid ? voltageValue / 1000.0f : 0;
   const uint32_t receivedSequence = readUint32(payload);
   const uint8_t quality = radioQuality(rssi, snr);
   const GpsStatus rxGpsStatus = localGpsStatus();
@@ -186,8 +232,14 @@ void receivePacket() {
 
   if (oled && !kAnemometer) {
     char metrics[96];
-    const int used = snprintf(metrics, sizeof(metrics), "%.0f dBm / %.1f dB\n",
-                              static_cast<double>(rssi), static_cast<double>(snr));
+    int used;
+    if (receivedWindValid) {
+      used = snprintf(metrics, sizeof(metrics), "W%.1f %.0fdBm S%.0f\n",
+                      double(receivedWindMs), double(rssi), double(snr));
+    } else {
+      used = snprintf(metrics, sizeof(metrics), "%.0f dBm / %.1f dB\n",
+                      double(rssi), double(snr));
+    }
     if (gpsStatus == Fix) {
       snprintf(metrics + used, sizeof(metrics) - used, "Lat %.6f\nLon %.6f", latitude, longitude);
       const size_t end = strlen(metrics);

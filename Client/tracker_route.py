@@ -1,10 +1,12 @@
 """Create an interactive signal map from a TrackerLoRa GPX export."""
 
 import argparse
+import csv
 from bisect import bisect_left
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import re
 import webbrowser
@@ -22,8 +24,117 @@ def position(point):
     return [float(point.get("lat", "")), float(point.get("lon", ""))]
 
 
-def save_signal_map(gpx_path):
+def route_summary(gpx_path, root):
+    from tracker_client import distance
+
+    length = 0
+    stamps = []
+    for segment in root.findall(".//{*}trkseg"):
+        points = list(segment)
+        stamps.extend(timestamp(point) for point in points)
+        length += sum(distance(position(a), position(b)) for a, b in zip(points, points[1:]))
+    ranges = []
+    elapsed = []
+    utc_stamps = []
+    csv_path = gpx_path.with_suffix(".csv")
+    log_path = gpx_path.with_suffix(".log")
+    if csv_path.exists():
+        with csv_path.open(encoding="utf-8-sig", newline="") as source:
+            for row in csv.DictReader(source):
+                try:
+                    elapsed.append(int(row.get("sample_ms", row.get("rx_ms", ""))) / 1000)
+                    if row.get("utc"):
+                        utc_stamps.append(datetime.fromisoformat(
+                            row["utc"].replace("Z", "+00:00")).timestamp())
+                    value = float(row.get("distance_m", ""))
+                    if math.isfinite(value) and value >= 0:
+                        ranges.append(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+    elif log_path.exists():
+        with log_path.open(encoding="utf-8-sig", errors="replace") as source:
+            for line in source:
+                fields = next(csv.reader([line.rstrip().split("\t")[-1]]))
+                if len(fields) not in (9, 12, 14):
+                    continue
+                try:
+                    elapsed.append(int(fields[0]) / 1000)
+                    int(fields[1])
+                    value = float(fields[8])
+                    if math.isfinite(value) and value >= 0:
+                        ranges.append(value)
+                except (ValueError, OverflowError):
+                    continue
+    real_stamps = utc_stamps or [stamp for stamp in stamps if
+                                datetime.fromtimestamp(stamp, timezone.utc).year >= 2000]
+    if real_stamps:
+        start = datetime.fromtimestamp(min(real_stamps), timezone.utc)
+        date_text = f"Sessione del {start.day}/{start.month}/{start.year} ore {start:%H:%M}"
+    else:
+        date_text = "Data e ora non disponibili"
+    clock = real_stamps or stamps or elapsed
+    seconds = max(0, int(max(clock)) - int(min(clock))) if clock else 0
+    duration = f"{seconds // 60}:{seconds % 60:02d}"
+    length_text = f"{length / 1000:.2f}".replace(".", ",")
+    max_range = f"{max(ranges) / 1000:.2f}".replace(".", ",") + " Km" if ranges else "n/d"
+    return (f"{date_text} - durata {duration} - {length_text} Km\n"
+            f"Distanza max raggiunta tra TX e RX {max_range}")
+
+
+def recover_tx_route(gpx_path):
+    """Read legacy live logs when the exported GPX has no RX track."""
+    log_path = gpx_path.with_suffix(".log")
+    if not log_path.exists():
+        return None
+    root = ET.Element("gpx")
+    track = ET.SubElement(root, "trk")
+    ET.SubElement(track, "name").text = "Percorso TX · GPS RX assente nella sessione"
+    segment = ET.SubElement(track, "trkseg")
+    nine_scale = False
+    previous_ms = None
+    count = 0
+    with log_path.open(encoding="utf-8-sig", errors="replace") as source:
+        for line in source:
+            # Some earlier serial loggers prefixed each line with a PC timestamp.
+            line = line.rstrip().split("\t")[-1]
+            if line.startswith("rx_ms,"):
+                nine_scale = "quality_0_9" in line
+                continue
+            fields = next(csv.reader([line]))
+            if len(fields) not in (9, 12) or fields[5] != "fix":
+                continue
+            try:
+                ms, seq, quality = int(fields[0]), int(fields[1]), int(fields[4])
+                lat, lon = float(fields[6]), float(fields[7])
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    continue
+                if not nine_scale:
+                    quality = max(0, quality - 1)
+                if not 0 <= quality <= 9:
+                    continue
+                stamp = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
+            except (ValueError, OverflowError):
+                continue
+            if previous_ms is not None and (ms < previous_ms or ms - previous_ms > 15000):
+                segment = ET.SubElement(track, "trkseg")
+            previous_ms = ms
+            for parent, tag in ((segment, "trkpt"), (root, "wpt")):
+                node = ET.SubElement(parent, tag, lat=str(lat), lon=str(lon))
+                ET.SubElement(node, "time").text = stamp.isoformat()
+                if tag == "wpt":
+                    ET.SubElement(node, "name").text = (
+                        f"TX #{seq} | Segnale {quality}/9 | Posizione TX"
+                        f" | Tempo dall'avvio {ms / 1000:.1f} s")
+            count += 1
+    return root if count else None
+
+
+def read_signal_route(gpx_path):
     root = ET.parse(gpx_path)
+    if not root.findall(".//{*}trkpt"):
+        recovered = recover_tx_route(gpx_path)
+        if recovered is not None:
+            root = ET.ElementTree(recovered)
     samples = []
     for waypoint in root.findall("{*}wpt"):
         label = waypoint.findtext("{*}name", "")
@@ -52,8 +163,12 @@ def save_signal_map(gpx_path):
                 if abs(time - midpoint) <= 5:
                     quality, label = score, detail
             edges.append([a, b, quality, label])
-    data = json.dumps({"edges": edges, "points": points,
-                       "name": root.findtext(".//{*}trk/{*}name", "Percorso RX")}).replace("<", "\\u003c")
+    return {"edges": edges, "points": points, "summary": route_summary(gpx_path, root),
+            "name": root.findtext(".//{*}trk/{*}name", "Percorso RX")}
+
+
+def save_signal_map(gpx_path):
+    data = json.dumps(read_signal_route(gpx_path)).replace("<", "\\u003c")
     output = gpx_path.with_suffix(".html")
     output.write_text(PAGE.replace("__ROUTE_DATA__", data), encoding="utf-8")
     return output
@@ -139,6 +254,10 @@ const bands = [
 const legend = document.querySelector('#legend');
 const hint = document.querySelector('#hint');
 document.querySelector('h1').textContent = 'TrackerLoRa · ' + route.name;
+const summary = document.createElement('p');
+summary.style.whiteSpace = 'pre-line';
+summary.textContent = route.summary;
+document.querySelector('header').append(summary);
 for (const [, color, label] of bands) {
   const item = document.createElement('span');
   item.style.setProperty('--color', color);

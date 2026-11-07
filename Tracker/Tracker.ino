@@ -18,7 +18,7 @@ void setup() {
   gpsSerial.setRX(kTransmitter ? 9 : 1);
   gpsSerial.setFIFOSize(512);
   gpsSerial.begin(kGpsBaud);
-  if (kAnemometer) {
+  if (kHasLocalAnemometer) {
     analogReadResolution(12);
   }
   if (kTransmitter) {
@@ -37,6 +37,9 @@ void setup() {
 
 void loop() {
   pollGps();
+  if (kHasLocalAnemometer) {
+    pollAnemometer();
+  }
   if (kTransmitter) {
     transmitPacket();
   } else {
@@ -55,9 +58,6 @@ void loop() {
     pollLogButton();
     pollLogCommands();
     receivePacket();
-    if (kAnemometer) {
-      pollAnemometer();
-    }
     if (sessionLog && millis() - lastLogFlushMs >= 15000) {
       sessionLog.flush();
       lastLogFlushMs = millis();

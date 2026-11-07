@@ -17,7 +17,12 @@ void showRadioStatus(uint32_t number, const char* status, int16_t error,
   oled->setTextSize(kTransmitter ? numberSize : rxNumberSize);
   oled->print(number);
   if (!kTransmitter) {
-    oled->print("/100");
+    oled->print('/');
+    if (linkActive && receivedWindValid) {
+      oled->print(receivedWindMs, 0);
+    } else {
+      oled->print("--");
+    }
     oled->setTextSize(2);
     oled->setCursor(116, 16);
     oled->print(quality > 0 ? quality - 1 : 0);

@@ -1,5 +1,29 @@
 #include "Tracker.h"
 
+static bool sessionPath(const char* path) {
+  return strlen(path) == 16 && strncmp(path, "/session", 8) == 0 &&
+         strspn(path + 8, "0123456789") == 4 && strcmp(path + 12, ".csv") == 0;
+}
+
+static uint32_t fileChecksum(File& file) {
+  uint32_t crc = 0xFFFFFFFF;
+  uint8_t buffer[128];
+  while (file.available()) {
+    const size_t count = file.read(buffer, sizeof(buffer));
+    if (count == 0) {
+      break;
+    }
+    for (size_t index = 0; index < count; ++index) {
+      crc ^= buffer[index];
+      for (unsigned bit = 0; bit < 8; ++bit) {
+        crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+      }
+    }
+    yield();
+  }
+  return ~crc;
+}
+
 void writeLog(const char* line) {
   if (sessionLog && sessionLog.println(line) != strlen(line) + 2) {
     sessionLog.close();
@@ -59,7 +83,7 @@ void pollLogButton() {
 }
 
 void pollLogCommands() {
-  static char command[32];
+  static char command[96];
   static size_t length = 0;
   static bool overflow = false;
   while (Serial.available()) {
@@ -78,6 +102,45 @@ void pollLogCommands() {
         Serial.println(sessionLog ? "# recording=1" : "# recording=0");
       } else if (!storageReady || sessionLog) {
         Serial.println("# stop recording first or check storage");
+      } else if (strcmp(command, "MEM") == 0) {
+        FSInfo info;
+        if (LittleFS.info(info)) {
+          Serial.printf("# MEM %lu %lu\n", (unsigned long)info.totalBytes,
+                        (unsigned long)info.usedBytes);
+        } else {
+          Serial.println("# memory_error");
+        }
+      } else if (strncmp(command, "CHECK ", 6) == 0 && sessionPath(command + 6)) {
+        File input = LittleFS.open(command + 6, "r");
+        if (input) {
+          const unsigned long size = input.size();
+          const unsigned long crc = fileChecksum(input);
+          input.close();
+          Serial.printf("# CHECK %s %lu %08lx\n", command + 6, size, crc);
+        } else {
+          Serial.println("# file not found");
+        }
+      } else if (strncmp(command, "DEL ", 4) == 0) {
+        char path[24], extra;
+        unsigned long expectedCrc, expectedSize;
+        if (sscanf(command + 4, "%23s %lx %lu %c", path, &expectedCrc, &expectedSize,
+                   &extra) == 3 && sessionPath(path)) {
+          File input = LittleFS.open(path, "r");
+          if (input) {
+            const bool sizeMatches = input.size() == expectedSize;
+            const bool matches = sizeMatches && fileChecksum(input) == expectedCrc;
+            input.close();
+            if (matches && LittleFS.remove(path)) {
+              Serial.printf("# DELETED %s\n", path);
+            } else {
+              Serial.println("# delete_error");
+            }
+          } else {
+            Serial.println("# file not found");
+          }
+        } else {
+          Serial.println("# delete_error");
+        }
       } else if (strcmp(command, "LIST") == 0) {
         Dir dir = LittleFS.openDir("/");
         while (dir.next()) {
