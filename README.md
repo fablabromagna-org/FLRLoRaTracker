@@ -4,7 +4,7 @@ Tracker LoRa con due Raspberry Pi Pico, GPS, radio SX1262 e display OLED SSD1306
 
 ## Firmware e librerie
 
-Lo sketch è in `FLRLoRaTracker/FLRLoRaTracker.ino`. Usa il core Arduino-Pico RP2040 e le librerie RadioLib, TinyGPSPlus e Adafruit SSD1306, con le relative dipendenze.
+Lo sketch è in `Tracker/Tracker.ino`. Usa il core Arduino-Pico RP2040 e le librerie RadioLib, TinyGPSPlus e Adafruit SSD1306, con le relative dipendenze.
 
 Imposta `kTransmitter = true` per il TX e `kTransmitter = false` per l'RX. Nella configurazione della scheda RX assegna spazio alla partizione filesystem LittleFS per le registrazioni. Il GPS usa UART a 9600 baud. La seriale USB del client usa 115200 baud.
 
@@ -40,9 +40,10 @@ Il display è cercato agli indirizzi I²C 0x3C e 0x3D. Il firmware prova GP4/GP5
 
 ## Installazione del client
 
-Collega l'RX via USB e chiudi il monitor seriale Arduino per liberare la porta COM. Installa Python per Windows con Tkinter, quindi esegui dalla cartella del progetto.
+Collega l'RX via USB e chiudi il monitor seriale Arduino per liberare la porta COM. Installa Python per Windows con Tkinter, quindi esegui dalla cartella principale del progetto.
 
 ```powershell
+cd Client
 py -m pip install -r requirements.txt
 py tracker_client.py
 ```
@@ -112,6 +113,25 @@ py tracker_route.py --serve sessioni/nome-giro.gpx
 Il comando apre un server accessibile dal solo PC e avvia il browser. Lascia aperto il terminale durante la consultazione e premi Ctrl+C quando hai finito. Il server locale gestisce le richieste della cartografia e la cache. Aprendo direttamente l'HTML come file si consulta il tracciato su sfondo neutro.
 
 ## File del progetto
+
+```text
+Tracker/
+    Tracker.ino
+Client/
+    requirements.txt
+    tracker_client.py
+    tracker_map.py
+    tracker_tiles.py
+    tracker_route.py
+    tracker_recordings.py
+    sessioni/          # dati locali
+    Registrazioni/    # dati locali
+FLRNemo/
+    TestLetturaCircuitPython/
+        code.py
+```
+
+I moduli Python elencati sotto si trovano in `Client`. Sessioni e registrazioni vengono salvate rispetto alla posizione del client, anche quando viene avviato da un'altra cartella. Per usare i comandi del visualizzatore da terminale entra prima in `Client`.
 
 - `tracker_client.py` contiene l'interfaccia desktop e la gestione seriale.
 - `tracker_map.py` gestisce la mappa live e i marcatori.
