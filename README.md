@@ -6,7 +6,21 @@ Tracker LoRa con due Raspberry Pi Pico, GPS, radio SX1262 e display OLED SSD1306
 
 Lo sketch è in `Tracker/Tracker.ino`. Usa il core Arduino-Pico RP2040 e le librerie RadioLib, TinyGPSPlus e Adafruit SSD1306, con le relative dipendenze.
 
-Imposta `kTransmitter = true` per il TX e `kTransmitter = false` per l'RX. Nella configurazione della scheda RX assegna spazio alla partizione filesystem LittleFS per le registrazioni. Il GPS usa UART a 9600 baud. La seriale USB del client usa 115200 baud.
+Imposta `TRACKER_ROLE` in `Tracker/Config.h`: `0` per TX, `1` per RX, `2` per RX con anemometro (predefinito). Nella configurazione della scheda RX assegna 1 MB alla partizione filesystem LittleFS, mantenendo la stessa dimensione nei successivi caricamenti. Il GPS usa UART a 9600 baud. La seriale USB del client usa 115200 baud.
+
+Il progetto usa moduli separati per radio, GPS, display, logger e anemometro. `Tracker.ino` contiene avvio e ciclo principale, mentre `Config.h` raccoglie ruolo, pin e parametri.
+
+### Calibrazione anemometro
+
+Nella configurazione 2 collega l'uscita analogica a A1/GP27 (pin fisico 32), con massa comune e segnale entro 0–3,3 V. Il firmware acquisisce a intervalli di 10 ms e produce una media ogni secondo. Il pulsante GP17 avvia e ferma una sessione anche senza LoRa o PC.
+
+Il CSV di calibrazione salva ADC medio/minimo/massimo, numero di campioni, durata della finestra, tensione, velocità anemometro provvisoria, velocità GPS in km/h e m/s, età dei dati, coordinate, quota, HDOP, satelliti, UTC quando valido e contatore PPS. I dati GPS mancanti rimangono vuoti. Le colonne radio riportano l'ultimo pacchetto e la sua età, senza determinare la cadenza di acquisizione.
+
+La conversione provvisoria è `max(0, 16,8 × (V − 0,021))` m/s. La pendenza deriva dai tratti stabili dei giri del 7 novembre 2026, mentre 0,021 V è il riferimento a riposo osservato sull'RX con il sensore fermo e il collegamento definitivo. Pendenza, zero e riferimento ADC nominale di 3,3 V sono in `Config.h`. Il CSV conserva i valori grezzi per ricalcolare la taratura dopo la prova.
+
+Sul display la seconda riga mostra `conteggio/vento` con il vento arrotondato in m/s e il segnale 0–9 a destra. Sotto compaiono vento con due decimali, velocità GPS, stato fix, satelliti e volt. `FLR REC` indica una registrazione attiva.
+
+Per scaricare una sessione usa `LIST` e `GET /session0001.csv` dalla seriale USB a 115200 baud. I CSV delle configurazioni 1 e 2 hanno intestazioni differenti e condividono la numerazione dei file. Il visualizzatore delle registrazioni radio del client Python richiede i CSV della configurazione 1.
 
 La configurazione radio nello sketch è 869,525 MHz, banda 125 kHz, SF9, CR 4/5, CRC a 2 byte e potenza impostata a 14 dBm. TX e RX devono usare gli stessi parametri radio.
 
