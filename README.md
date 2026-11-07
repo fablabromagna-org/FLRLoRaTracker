@@ -1,6 +1,6 @@
 # FLRLoRaTracker
 
-<img src="images/logo_fablabromagna.png" alt="FabLab Romagna" width="250">
+<img src="images/logo_fablabromagna_readme.svg" alt="FabLab Romagna" width="250">
 
 Un sistema LoRa per misurare il vento, seguire le posizioni GPS e verificare la qualità del collegamento sul territorio. Due Raspberry Pi Pico costituiscono il trasmettitore TX e il ricevitore RX. Un client Python sul portatile mostra la ricezione e i percorsi su OpenStreetMap.
 
