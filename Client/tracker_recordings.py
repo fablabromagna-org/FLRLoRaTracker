@@ -10,6 +10,7 @@ def read_recording(path):
     segments, samples = [[]], []
     previous_ms = None
     last = None
+    last_sample = None
     has_rx = False
     with path.open(encoding="utf-8-sig", newline="") as source:
         reader = csv.DictReader(source)
@@ -24,15 +25,16 @@ def read_recording(path):
         for row in reader:
             try:
                 ms = int(row["sample_ms"] if wind_format else row["rx_ms"])
-                if wind_format and row.get("utc"):
+                if row.get("utc"):
                     utc = datetime.fromisoformat(row["utc"].replace("Z", "+00:00"))
                     if utc.tzinfo is None:
                         raise ValueError("Orario UTC senza fuso orario")
                     clock_origin = utc - timedelta(milliseconds=ms)
-                quality = int(row.get("quality_0_9", row.get("quality", "")))
-                if "quality_0_9" not in row:
+                gps_only = row.get("record_type") == "gps"
+                quality = None if gps_only else int(row.get("quality_0_9", row.get("quality", "")))
+                if not gps_only and "quality_0_9" not in row:
                     quality = max(0, quality - 1)
-                if not 0 <= quality <= 9:
+                if not gps_only and not 0 <= quality <= 9:
                     raise ValueError("Segnale fuori intervallo")
                 rx = wind_format or bool(row.get("rx_lat") and row.get("rx_lon"))
                 if wind_format:
@@ -62,11 +64,14 @@ def read_recording(path):
             if previous_ms is not None and (ms < previous_ms or ms - previous_ms > 15000):
                 segments.append([])
                 last = None
+                last_sample = None
             previous_ms = ms
-            if last is not None and distance(last, position) < 3:
-                continue
             fix = (position, altitude, speed, stamp)
-            segments[-1].append(fix)
+            if last is None or distance(last, position) >= 3:
+                segments[-1].append(fix)
+                last = position
+            if gps_only or (last_sample is not None and distance(last_sample, position) < 3):
+                continue
             height = f"{altitude:.1f} m" if altitude is not None else "n/d"
             packet = f"TX #{sequence}" if sequence is not None else "TX non ricevuto"
             label = (f"{packet} | Segnale {quality}/9 | Altitudine RX {height}"
@@ -75,5 +80,5 @@ def read_recording(path):
                 label += (f" | GPS {row.get('gps_kmh') or 'n/d'} km/h"
                           f" | Vento provvisorio {row.get('wind_ms_provisional') or 'n/d'} m/s")
             samples.append((fix, label))
-            last = position
+            last_sample = position
     return segments, samples, has_rx

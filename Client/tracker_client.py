@@ -117,6 +117,8 @@ class Client:
         self.segments, self.samples = [[]], []
         self.last_sample = self.path = self.followed_rx = None
         self.centered = False
+        self.battery_values = {"RX": None, "TX": None}
+        self.battery_timeout = {"RX": 10.0, "TX": 9.0}
         self.memory = MemoryManager(self, RECORDINGS_DIR)
         root.title("TrackerLoRa")
         root.geometry("1280x800")
@@ -163,7 +165,9 @@ class Client:
             self.ports.set(usb_ports[0].device)
         elif not usb_ports and len(available) == 1:
             self.ports.set(available[0].device)
-        ttk.Button(connection, text="COLLEGA", command=self.connect).pack(side="left")
+        self.connection_button = ttk.Button(
+            connection, text="Connetti", command=self.toggle_connection)
+        self.connection_button.pack(side="left")
         ttk.Button(connection, text="LIVE", command=self.show_live).pack(side="left", padx=(4, 0))
         ttk.Button(connection, text="REGISTRAZIONI", command=self.download_recordings).pack(
             side="left", padx=(4, 0))
@@ -206,6 +210,9 @@ class Client:
         self.draw_signal()
         ttk.Label(details, textvariable=self.received, style="Card.TLabel",
                   font=("Segoe UI", 14, "bold"), justify="left").pack(anchor="w")
+        self.battery_text = tk.StringVar(value="Batteria RX: n/d   ·   Batteria TX: n/d")
+        ttk.Label(details, textvariable=self.battery_text, style="Card.TLabel",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(4, 0))
         self.route_info = tk.StringVar()
         self.route_summary = ttk.Label(self.info_panel, textvariable=self.route_info,
                                         style="Card.TLabel", font=("Segoe UI", 14, "bold"),
@@ -278,6 +285,37 @@ class Client:
         self.ports.configure(state="normal" if state == "idle" else "disabled")
         self.status.set(status)
 
+    def toggle_connection(self):
+        if self.port is None:
+            self.connect()
+        else:
+            self.disconnect()
+
+    def disconnect(self, status="RX disconnesso"):
+        port, self.port = self.port, None
+        if port is not None:
+            try:
+                port.close()
+            except OSError:
+                pass  # Windows can report another error after USB removal.
+        self.connection_button.configure(text="Connetti")
+        self.cancel_transfer()
+        self.sync_on_stop = False
+        self.pending = b""
+        self.sync_line = True
+        self.set_rec(None)
+        self.battery_values = {"RX": None, "TX": None}
+        self.refresh_batteries()
+        self.memory.pending = []
+        self.memory.verified = []
+        if self.memory.window is not None and self.memory.window.winfo_exists():
+            self.memory.info.set(status)
+        if self.state != "idle":
+            if not self.stop():
+                return
+            status += " · sessione PC salvata"
+        self.status.set(status)
+
     def connect(self):
         device = self.ports.get().strip()
         if self.port is not None:
@@ -287,9 +325,7 @@ class Client:
             if self.state != "idle" or self.transfer:
                 messagebox.showinfo("Ricevitore RX", "Termina la sessione o il download prima di cambiare COM.")
                 return
-            self.port.close()
-            self.port = None
-            self.set_rec(None)
+            self.disconnect()
         if not device:
             messagebox.showinfo("Ricevitore RX", "Seleziona la porta COM del ricevitore RX.")
             return
@@ -301,13 +337,15 @@ class Client:
             self.port.dtr = True
             self.pending = b""
             self.sync_line = True
+            self.battery_values = {"RX": None, "TX": None}
+            self.battery_timeout = {"RX": 10.0, "TX": 9.0}
+            self.refresh_batteries()
             self.port.write(b"STATUS\n")
+            self.connection_button.configure(text="Disconnetti")
             self.show_live()
             self.status.set("RX collegato · ricezione live")
         except (OSError, ValueError) as error:
-            if self.port is not None:
-                self.port.close()
-                self.port = None
+            self.disconnect()
             messagebox.showerror("Collegamento RX", str(error))
 
     def set_rec(self, recording):
@@ -316,6 +354,31 @@ class Client:
         if recording is None:
             text = "REC · sconosciuto"
         self.rec_label.configure(text=text, fg="#dc2626" if recording else "#475569")
+
+    def update_battery(self, name, value):
+        try:
+            volts = float(value)
+            if not math.isfinite(volts) or not 2.5 <= volts <= 4.35:
+                raise ValueError
+            self.battery_values[name] = (volts, time.monotonic())
+        except (TypeError, ValueError):
+            self.battery_values[name] = None
+        self.refresh_batteries()
+
+    def refresh_batteries(self):
+        values = []
+        now = time.monotonic()
+        for name, reading in self.battery_values.items():
+            text = "n/d"
+            if reading is not None:
+                volts, stamp = reading
+                text = f"{volts:.2f} V".replace(".", ",")
+                if self.port is None or now - stamp > self.battery_timeout[name]:
+                    text += " (dato precedente)"
+            values.append(f"Batteria {name}: {text}")
+        text = "   ·   ".join(values)
+        if self.battery_text.get() != text:
+            self.battery_text.set(text)
 
     def cancel_transfer(self):
         if self.transfer_file is not None:
@@ -414,6 +477,26 @@ class Client:
             messagebox.showerror("Pico", str(error))
 
     def device_line(self, line):
+        if self.transfer != "csv":
+            if line.startswith("# battery_v="):
+                self.update_battery("RX", line.split()[1].split("=", 1)[1])
+            elif line.startswith("# rx_radio "):
+                fields = dict(word.split("=", 1) for word in line.split() if "=" in word)
+                try:
+                    self.battery_timeout["TX"] = max(9.0, 3 * int(fields["interval_ms"]) / 1000)
+                except (KeyError, ValueError):
+                    pass
+            elif not line.startswith("#"):
+                fields = line.split(",")
+                if len(fields) == 18 and fields[14] == "radio":
+                    try:
+                        int(fields[0])
+                        int(fields[1])
+                    except ValueError:
+                        pass
+                    else:
+                        self.update_battery("TX", fields[16])
+                        self.update_battery("RX", fields[17])
         if line.startswith(("# tx_seq=", "# tx_error=")):
             if self.transfer:
                 self.cancel_transfer()
@@ -523,7 +606,7 @@ class Client:
         from tracker_recordings import read_recording
         try:
             segments, samples, has_rx = read_recording(filename)
-            if not samples:
+            if not any(segments):
                 messagebox.showinfo("Registrazione", "CSV salvato. Nessuna posizione GPS valida.")
                 return
             base = filename.with_suffix("")
@@ -552,9 +635,7 @@ class Client:
                 self.base = SESSIONS_DIR / datetime.now().strftime("giro-%Y%m%d-%H%M%S-%f")
                 self.log = self.base.with_suffix(".log").open("xb")
             except (OSError, ValueError) as error:
-                if self.port is not None:
-                    self.port.close()
-                    self.port = None
+                self.disconnect()
                 messagebox.showerror("START", str(error))
                 return
             self.segments, self.samples = [[]], []
@@ -668,9 +749,7 @@ class Client:
 
     def close(self):
         if self.stop():
-            self.cancel_transfer()
-            if self.port is not None:
-                self.port.close()
+            self.disconnect()
             self.root.destroy()
 
     def poll(self):
@@ -703,14 +782,13 @@ class Client:
                     "Pico", f"Nessuna risposta completa per {operation} da {self.port.port}. "
                     "Controlla di aver selezionato il ricevitore RX e che REC sia fermo.")
         except OSError as error:
-            self.cancel_transfer()
-            self.stop()
-            if self.port is not None:
-                self.port.close()
-                self.port = None
-            self.set_rec(None)
-            messagebox.showerror("Lettura RX", str(error))
+            if isinstance(error, self.serial.SerialException):
+                self.disconnect("Collegamento RX interrotto · ricollega il dispositivo e premi Connetti")
+            else:
+                self.disconnect("Errore di lettura o salvataggio")
+                messagebox.showerror("Lettura RX", str(error))
         finally:
+            self.refresh_batteries()
             self.root.after(1 if self.transfer else 50, self.poll)
 
     def marker(self, name, position):
@@ -760,7 +838,7 @@ class Client:
             return
 
         fields = line.split(",")
-        if len(fields) not in (9, 12, 14):
+        if len(fields) not in (9, 12, 14, 16, 18):
             return
         try:
             int(fields[0])
@@ -773,6 +851,8 @@ class Client:
                 self.marker("TX", coordinates(fields[6], fields[7]))
         except ValueError:
             return
+        if len(fields) < 18:
+            self.update_battery("TX", None)
         fresh_rx = self.rx is not None and (now - self.rx[3]).total_seconds() <= 5
         try:
             meters = float(fields[8])
@@ -785,7 +865,7 @@ class Client:
         else:
             range_text = f"{meters:.0f} m"
         wind_text = "n/d"
-        if len(fields) == 14:
+        if len(fields) >= 14:
             try:
                 wind_speed = float(fields[12])
                 if math.isfinite(wind_speed) and wind_speed >= 0:

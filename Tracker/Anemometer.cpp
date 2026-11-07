@@ -6,7 +6,8 @@ const char* sessionHeader() {
   return kAnemometer
       ? "sample_ms,window_ms,adc_samples,adc_mean,adc_min,adc_max,volts,wind_ms_provisional,"
         "gps_status,fix_age_ms,speed_age_ms,gps_kmh,gps_ms,course_deg,lat,lon,altitude_m,"
-        "hdop,satellites,utc,pps_count,radio_seq,radio_age_ms,quality_0_9,tx_wind_ms,tx_wind_volts"
+        "hdop,satellites,utc,pps_count,radio_seq,radio_age_ms,quality_0_9,tx_wind_ms,tx_wind_volts,"
+        "tx_battery_v,rx_battery_v"
       : kCsvHeader;
 }
 
@@ -113,10 +114,12 @@ static void emitWindSample() {
   const String radioAge = hasReceivedPacket ? String(millis() - lastRxMs) : String();
   const String txWind = linkActive && receivedWindValid ? String(receivedWindMs, 2) : String();
   const String txVolts = linkActive && receivedVoltageValid ? String(receivedWindVolts, 3) : String();
+  const String txBattery = linkActive && receivedBatteryValid ? String(receivedBatteryVolts, 3) : String();
+  const String rxBattery = battery.valid ? String(battery.volts, 3) : String();
   char line[512];
   const int length = snprintf(
       line, sizeof(line),
-      "%llu,%lu,%lu,%.2f,%u,%u,%.5f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%lu,%s,%s,%u,%s,%s",
+      "%llu,%lu,%lu,%.2f,%u,%u,%.5f,%.3f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%lu,%s,%s,%u,%s,%s,%s,%s",
       static_cast<unsigned long long>(wind.sampleMs),
       static_cast<unsigned long>(wind.windowMs),
       static_cast<unsigned long>(wind.adcSamples),
@@ -125,7 +128,8 @@ static void emitWindSample() {
       fixAge.c_str(), speedAge.c_str(), kmh.c_str(), ms.c_str(), course.c_str(),
       lat.c_str(), lon.c_str(), altitude.c_str(), hdop.c_str(), sats.c_str(), utc,
       static_cast<unsigned long>(ppsCount), radioSeq.c_str(), radioAge.c_str(),
-      unsigned(linkActive && lastQuality ? lastQuality - 1 : 0), txWind.c_str(), txVolts.c_str());
+      unsigned(linkActive && lastQuality ? lastQuality - 1 : 0), txWind.c_str(), txVolts.c_str(),
+      txBattery.c_str(), rxBattery.c_str());
   if (length < 0 || size_t(length) >= sizeof(line)) {
     return;
   }

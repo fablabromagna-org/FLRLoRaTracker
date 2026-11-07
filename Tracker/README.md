@@ -10,6 +10,39 @@ Imposta `TRACKER_ROLE` in `Config.h`: `0` per TX con anemometro, `1` per RX (pre
 
 Il progetto usa moduli separati per radio, GPS, display, logger e anemometro. `Tracker.ino` contiene avvio e ciclo principale, mentre `Config.h` raccoglie ruolo, pin e parametri.
 
+### TX su Waveshare RP2040-LoRa-HF
+
+Per la scheda con radio integrata imposta `TRACKER_ROLE=0` in `Config.h` e `TRACKER_HARDWARE=1` in `Hardware.h`. Il valore hardware `0` mantiene il cablaggio del Pico con shield. Le tre configurazioni funzionali rimangono TX, RX e RX da taratura; il profilo integrato è predisposto per il TX.
+
+La RP2040-LoRa deve essere la versione HF, compatibile con la frequenza di progetto 869,525 MHz. Si compila con lo stesso core Arduino-Pico e scheda Raspberry Pi Pico, flash 2 MB. Il sorgente Waveshare conferma TCXO a 1,7 V, DIO2 come controllo RF e GP17 alto a riposo/RX, basso in TX. Il firmware gestisce GP17 con la tabella RF di RadioLib.
+
+| Segnale radio | Pico con shield | RP2040-LoRa-HF |
+| --- | --- | --- |
+| SCK, SPI1 | GP10 | GP14 |
+| MOSI, SPI1 | GP11 | GP15 |
+| MISO, SPI1 | GP12 | GP24 |
+| CS | GP3 | GP13 |
+| RESET | GP15 | GP23 |
+| DIO1 | GP20 | GP16 |
+| BUSY | GP2 | GP18 |
+| Selettore RF esterno | Gestito dallo shield | GP17, attivo basso in TX |
+
+Sulla scheda integrata collega l'anemometro a GP27/ADC1, il GPS con TX GPS → GP9 e RX GPS → GP8, e l'OLED con SDA → GP4 e SCL → GP5. La coppia OLED GP6/GP7 è supportata come sul dispositivo precedente. Usa i numeri GPIO riportati sulla nuova scheda, la cui disposizione fisica differisce dal Pico a 40 pin. Collega le masse e mantieni i segnali entro 3,3 V.
+
+La scheda integrata usa un regolatore ME6217 e richiede un progetto di alimentazione batteria dedicato. Il partitore BATTERY_AD e il caricatore MCP73831 appartengono allo shield del kit precedente. Nel profilo integrato `kBatteryMonitorEnabled` è quindi disabilitato e il TX trasmette batteria mancante. Per misurarla, realizza un partitore esterno su GP26 e abilita la misura in `Config.h`, impostando il rapporto effettivo.
+
+I dettagli elettrici sono documentati nella [wiki Waveshare](https://www.waveshare.com/wiki/RP2040-LoRa) e nello [schema RP2040-LoRa](https://files.waveshare.com/wiki/RP2040-LoRa/Rp2040-lora-sch.pdf).
+
+### Batterie del kit Waveshare
+
+Le colonne finali `tx_battery_v` e `rx_battery_v` dei CSV riportano le tensioni delle due batterie. Il TX trasmette la propria misura via LoRa; l'RX misura la propria batteria anche nei record GPS locali durante le pause radio. I CSV di calibrazione includono gli stessi due campi. I pacchetti dei firmware precedenti producono un campo TX vuoto.
+
+La lettura usa GP26/A0 e il partitore BATTERY_AD dello schema Waveshare (R17=200 kΩ, R18=100 kΩ, R19=0 Ω), con rapporto configurabile `kBatteryDividerRatio = 3`. Queste resistenze sono indicate come opzionali nello schema. Verifica la dotazione della scheda e confronta una lettura con un multimetro prima di usare le tensioni per valutare l'autonomia. Se la misura ricostruita è fuori 2,5–4,35 V, il campo resta vuoto e la diagnostica seriale mostra `battery_v=unavailable` con il valore ADC grezzo.
+
+Le misure riportano la tensione del nodo batteria. La tensione varia con il carico e la ricarica USB.
+
+Il circuito è documentato nello [schema Waveshare Pico-LoRa-SX1262](https://files.waveshare.com/upload/d/d8/Pico-LoRa-SX1262_Sch.pdf).
+
 Il TX acquisisce l'anemometro su A1/GP27 e applica `max(0, 16,8 × (V − 0,021))` m/s. Ogni 3 secondi invia il vento a risoluzione 0,01 m/s e la tensione a risoluzione 1 mV, anche senza fix GPS. Al primo avvio, in assenza di una misura recente o con ADC saturo, il vento viene segnalato come mancante. Il display TX mostra il vento locale e l'esito dell'invio.
 
 L'RX mostra `conteggio/vento` e il segnale 0–9 a destra. Il CSV radio aggiunge `wind_ms` e `wind_volts` alle colonne esistenti. I pacchetti dei firmware precedenti rimangono leggibili e producono campi vento vuoti. Sul display `--` indica vento mancante o collegamento scaduto.
@@ -83,11 +116,38 @@ STATUS è disponibile anche durante REC. Gli altri comandi richiedono REC fermo 
 | --- | --- |
 | `Tracker.ino` | Inizializzazione e ciclo principale |
 | `Config.h` | Ruolo, GPIO, parametri radio e anemometro |
+| `Hardware.h` | Pin radio e selezione Pico con shield oppure RP2040-LoRa-HF |
 | `Tracker.h`, `TrackerState.cpp` | Dichiarazioni e stato condiviso |
 | `Radio.cpp` | Trasmissione, ricezione e formato dei pacchetti |
 | `Gps.cpp` | Lettura GPS e diagnostica |
 | `Display.cpp` | Interfaccia OLED |
 | `Logger.cpp` | Pulsante REC, LittleFS e comandi seriali |
+| `LinkAlerts.cpp` | LED RGB e beeper opzionali per lo stato del collegamento |
 | `Anemometer.cpp` | Acquisizione analogica e registrazioni di taratura |
 
 Per consultare le registrazioni e gestire la memoria dal portatile segui la [guida del client](../Client/README.md).
+
+## Traccia GPS autonoma sul ricevitore
+
+Durante REC, il ruolo RX normale salva un campione GPS locale ogni secondo, anche quando non arriva LoRa. I pacchetti radio continuano a essere registrati al momento della ricezione. Il CSV distingue le righe con la colonna `record_type`, che vale `gps` o `radio`, e aggiunge `utc` quando il GPS fornisce data e ora valide.
+
+Le righe GPS autonome lasciano vuoti i dati radio. Quando manca un fix recente, rimangono vuote anche le coordinate. Il client ricostruisce il percorso dai fix validi e colora in grigio i tratti senza una misura radio recente. Il ruolo 2 conserva la propria acquisizione ogni secondo del GPS e dell'anemometro.
+
+## LED RGB e beeper opzionali
+
+Gli avvisi sono predisposti per un LED RGB a catodo comune e un piezo passivo compatibile con un'uscita logica a 3,3 V. Le opzioni `kRgbEnabled` e `kBeeperEnabled` in Config.h sono inizialmente `false`. Impostale a `true` dopo aver collegato i componenti.
+
+| Componente | GPIO RX | Collegamento previsto |
+| --- | --- | --- |
+| LED rosso | GP18 | Anodo rosso attraverso una resistenza dedicata, per esempio 470 Ω |
+| LED verde | GP19 | Anodo verde attraverso una resistenza dedicata |
+| LED blu | GP21 | Anodo blu attraverso una resistenza dedicata |
+| LED RGB | GND | Catodo comune |
+| Piezo passivo | GP22 | Ingresso del piezo compatibile o del suo circuito di pilotaggio |
+| Piezo / circuito di pilotaggio | GND | Massa comune |
+
+Un modulo RGB ad anodo comune richiede polarità invertita rispetto a questa configurazione. Per un buzzer amplificato o alimentato a tensione diversa serve un circuito di pilotaggio adeguato al suo modello.
+
+Il LED mostra verde per 6–9, giallo per 2–5 e rosso per 0–1. Prima del primo pacchetto lampeggia blu. Dopo la perdita del collegamento lampeggia rosso. Il timeout corrisponde ad almeno tre intervalli attesi fra i pacchetti, normalmente 9 secondi con TX ogni 3 secondi.
+
+Il beeper emette due suoni brevi alla perdita del collegamento e uno più acuto alla ripresa. Gli avvisi sono emessi al cambio di stato e non richiedono attese bloccanti. Il generatore usa le funzioni tone del [core Arduino-Pico](https://arduino-pico.readthedocs.io/en/stable/digital.html).

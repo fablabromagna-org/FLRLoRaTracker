@@ -55,7 +55,7 @@ def route_summary(gpx_path, root):
         with log_path.open(encoding="utf-8-sig", errors="replace") as source:
             for line in source:
                 fields = next(csv.reader([line.rstrip().split("\t")[-1]]))
-                if len(fields) not in (9, 12, 14):
+                if len(fields) not in (9, 12, 14, 16):
                     continue
                 try:
                     elapsed.append(int(fields[0]) / 1000)
@@ -101,7 +101,7 @@ def recover_tx_route(gpx_path):
                 nine_scale = "quality_0_9" in line
                 continue
             fields = next(csv.reader([line]))
-            if len(fields) not in (9, 12) or fields[5] != "fix":
+            if len(fields) not in (9, 12, 14, 16) or fields[5] != "fix":
                 continue
             try:
                 ms, seq, quality = int(fields[0]), int(fields[1]), int(fields[4])

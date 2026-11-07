@@ -106,7 +106,7 @@ void reportRxGps() {
     Serial.print(" irq=");
     Serial.print(radio.getIrqFlags(), HEX);
     Serial.print(" dio1=");
-    Serial.print(digitalRead(20));
+    Serial.print(digitalRead(kRadioDio1Pin));
     Serial.print(" interval_ms=");
     Serial.print(observedIntervalMs);
     Serial.println();

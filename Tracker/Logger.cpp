@@ -1,5 +1,46 @@
 #include "Tracker.h"
 
+String gpsUtc() {
+  if (gps.date.isValid() && gps.time.isValid() &&
+      gps.date.age() <= kGpsFreshMs && gps.time.age() <= kGpsFreshMs) {
+    char utc[24];
+    snprintf(utc, sizeof(utc), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             unsigned(gps.date.year()), unsigned(gps.date.month()), unsigned(gps.date.day()),
+             unsigned(gps.time.hour()), unsigned(gps.time.minute()), unsigned(gps.time.second()));
+    return String(utc);
+  }
+  return String();
+}
+
+void pollRxLog() {
+  static uint32_t lastSampleMs = 0;
+  const uint32_t now = millis();
+  if (!sessionLog || kAnemometer || now - lastSampleMs < 1000) {
+    return;
+  }
+  lastSampleMs = now;
+  const bool fix = localGpsStatus() == Fix;
+  const String lat = fix ? String(gps.location.lat(), 6) : String();
+  const String lon = fix ? String(gps.location.lng(), 6) : String();
+  const String altitude = fix && gps.altitude.isValid() && gps.altitude.age() <= kGpsFreshMs
+      ? String(gps.altitude.meters(), 1) : String();
+  char line[160];
+  snprintf(line, sizeof(line), "%llu,,,,,,,,,%s,%s,%s,,,gps,",
+           static_cast<unsigned long long>(time_us_64() / 1000),
+           lat.c_str(), lon.c_str(), altitude.c_str());
+  String record(line);
+  record += gpsUtc();
+  record += ',';
+  if (linkActive && receivedBatteryValid) {
+    record += String(receivedBatteryVolts, 3);
+  }
+  record += ',';
+  if (battery.valid) {
+    record += String(battery.volts, 3);
+  }
+  writeLog(record.c_str());
+}
+
 static bool sessionPath(const char* path) {
   return strlen(path) == 16 && strncmp(path, "/session", 8) == 0 &&
          strspn(path + 8, "0123456789") == 4 && strcmp(path + 12, ".csv") == 0;

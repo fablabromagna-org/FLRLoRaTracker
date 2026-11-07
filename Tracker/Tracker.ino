@@ -4,10 +4,23 @@ void setup() {
   Serial.begin(115200);
   initDisplay();
   showRadioStatus(0, "Starting...");
-  SPI1.setSCK(10);
-  SPI1.setTX(11);
-  SPI1.setRX(12);
+  SPI1.setSCK(kRadioSckPin);
+  SPI1.setTX(kRadioMosiPin);
+  SPI1.setRX(kRadioMisoPin);
   SPI1.begin();
+
+  if (kIntegratedLoRa) {
+    const uint32_t pins[Module::RFSWITCH_MAX_PINS] = {
+        kRadioAntennaSwitchPin, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC
+    };
+    static const Module::RfSwitchMode_t modes[] = {
+        {Module::MODE_IDLE, {HIGH, LOW, LOW}},
+        {Module::MODE_RX,   {HIGH, LOW, LOW}},
+        {Module::MODE_TX,   {LOW, LOW, LOW}},
+        END_OF_MODE_TABLE
+    };
+    radio.setRfSwitchTable(pins, modes);
+  }
 
   // MHz, kHz, SF, CR denominator, sync word, dBm, preamble, TCXO V.
   checkRadio(radio.begin(869.525, 125.0, 9, 5,
@@ -18,12 +31,11 @@ void setup() {
   gpsSerial.setRX(kTransmitter ? 9 : 1);
   gpsSerial.setFIFOSize(512);
   gpsSerial.begin(kGpsBaud);
-  if (kHasLocalAnemometer) {
-    analogReadResolution(12);
-  }
+  analogReadResolution(12);
   if (kTransmitter) {
     lastTxMs = millis() - kIntervalMs;
   } else {
+    initLinkAlerts();
     pinMode(kLogButtonPin, INPUT_PULLUP);
     storageReady = LittleFS.begin();
     logError = !storageReady;
@@ -37,6 +49,7 @@ void setup() {
 
 void loop() {
   pollGps();
+  pollBattery();
   if (kHasLocalAnemometer) {
     pollAnemometer();
   }
@@ -58,6 +71,7 @@ void loop() {
     pollLogButton();
     pollLogCommands();
     receivePacket();
+    pollRxLog();
     if (sessionLog && millis() - lastLogFlushMs >= 15000) {
       sessionLog.flush();
       lastLogFlushMs = millis();
@@ -66,6 +80,7 @@ void loop() {
     if (linkActive && millis() - lastRxMs >= timeoutMs) {
       linkActive = false;
     }
+    pollLinkAlerts();
     reportRxGps();
   }
   delay(1);

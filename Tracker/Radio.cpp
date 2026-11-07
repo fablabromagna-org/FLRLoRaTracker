@@ -62,7 +62,11 @@ void transmitPacket() {
   const uint16_t voltageValue = sampleFresh
       ? static_cast<uint16_t>(wind.volts * 1000 + 0.5f) : kMissingWindValue;
   writeUint32(payload + baseLength, uint32_t(windValue) | (uint32_t(voltageValue) << 16));
-  const int16_t status = radio.transmit(payload, baseLength + kWindExtensionSize);
+  const uint16_t batteryValue = battery.valid
+      ? static_cast<uint16_t>(battery.volts * 1000 + 0.5f) : kMissingWindValue;
+  payload[baseLength + kWindExtensionSize] = batteryValue & 0xFF;
+  payload[baseLength + kWindExtensionSize + 1] = batteryValue >> 8;
+  const int16_t status = radio.transmit(payload, baseLength + kTelemetryExtensionSize);
   lastTxStatus = status;
   if (Serial && status == RADIOLIB_ERR_NONE) {
     Serial.print("# tx_seq=");
@@ -80,6 +84,12 @@ void transmitPacket() {
     Serial.print(" volts=");
     if (voltageValue != kMissingWindValue) {
       Serial.print(voltageValue / 1000.0f, 3);
+    } else {
+      Serial.print("missing");
+    }
+    Serial.print(" battery_v=");
+    if (batteryValue != kMissingWindValue) {
+      Serial.print(batteryValue / 1000.0f, 3);
     } else {
       Serial.print("missing");
     }
@@ -140,6 +150,16 @@ void printPacket(Print& output, uint64_t receivedMs, uint32_t receivedSequence,
   if (receivedVoltageValid) {
     output.print(receivedWindVolts, 3);
   }
+  output.print(",radio,");
+  output.print(gpsUtc());
+  output.print(',');
+  if (receivedBatteryValid) {
+    output.print(receivedBatteryVolts, 3);
+  }
+  output.print(',');
+  if (battery.valid) {
+    output.print(battery.volts, 3);
+  }
   output.println();
 }
 
@@ -155,9 +175,14 @@ void receivePacket() {
 
   uint8_t payload[kMaxPayloadSize];
   const size_t length = radio.getPacketLength();
-  const bool hasWindExtension = length == kStatusSize + kWindExtensionSize ||
+  const bool hasBatteryExtension = length == kStatusSize + kTelemetryExtensionSize ||
+                                   length == kPositionSize + kTelemetryExtensionSize;
+  const bool hasWindExtension = hasBatteryExtension ||
+                                length == kStatusSize + kWindExtensionSize ||
                                 length == kPositionSize + kWindExtensionSize;
-  const size_t baseLength = hasWindExtension ? length - kWindExtensionSize : length;
+  const size_t extensionSize = hasBatteryExtension ? kTelemetryExtensionSize :
+                               hasWindExtension ? kWindExtensionSize : 0;
+  const size_t baseLength = length - extensionSize;
   const int16_t status = radio.readData(payload, sizeof(payload));
   const float rssi = radio.getRSSI();
   const float snr = radio.getSNR();
@@ -194,6 +219,7 @@ void receivePacket() {
   }
   uint16_t windValue = kMissingWindValue;
   uint16_t voltageValue = kMissingWindValue;
+  uint16_t batteryValue = kMissingWindValue;
   if (hasWindExtension) {
     const uint32_t extension = readUint32(payload + baseLength);
     windValue = extension & 0xFFFF;
@@ -204,6 +230,17 @@ void receivePacket() {
       return;
     }
   }
+  if (hasBatteryExtension) {
+    const size_t offset = baseLength + kWindExtensionSize;
+    batteryValue = uint16_t(payload[offset]) | (uint16_t(payload[offset + 1]) << 8);
+    if (batteryValue != kMissingWindValue &&
+        (batteryValue < kBatteryMinValidV * 1000 || batteryValue > kBatteryMaxValidV * 1000)) {
+      ++invalidPackets;
+      return;
+    }
+  }
+  receivedBatteryValid = batteryValue != kMissingWindValue;
+  receivedBatteryVolts = receivedBatteryValid ? batteryValue / 1000.0f : 0;
   receivedWindValid = windValue != kMissingWindValue;
   receivedVoltageValid = voltageValue != kMissingWindValue;
   receivedWindMs = receivedWindValid ? windValue / 100.0f : 0;

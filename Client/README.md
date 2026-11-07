@@ -18,7 +18,9 @@ Con un solo dispositivo USB disponibile il client propone la sua COM. Con più d
 
 L'interfaccia raggruppa i comandi in Ricevitore e Sessioni lanciate da PC e mostra il logo FabLab Romagna in alto a destra. La vista live mostra segnale e progressivo TX, mentre la consultazione delle sessioni usa un riepilogo compatto del percorso. La legenda resta visibile sopra la mappa.
 
-Premi **COLLEGA** per monitorare l'RX. Il riepilogo superiore mostra la distanza RX–TX, lo stato GPS e il progressivo TX in grande sulla destra. La distanza viene mostrata in metri o chilometri quando è disponibile.
+Premi **Connetti** per monitorare l'RX. Il riepilogo superiore mostra la distanza RX–TX, lo stato GPS e il progressivo TX in grande sulla destra. La distanza viene mostrata in metri o chilometri quando è disponibile.
+
+La vista live mostra anche **Batteria RX** e **Batteria TX** in volt. La tensione RX si aggiorna dalla diagnostica locale anche durante le pause radio, mentre la tensione TX arriva nei pacchetti LoRa. Un valore mancante o non valido appare come `n/d`. Una misura non aggiornata viene indicata come `dato precedente`. La soglia TX segue il timeout del collegamento, normalmente 9 secondi. Le letture presenti nei CSV scaricati non modificano gli indicatori live.
 
 La barra orizzontale indica il segnale su scala **0–9**, con il numero al centro.
 
@@ -56,7 +58,7 @@ Il pulsante su GP17 avvia la registrazione sul ricevitore. Sul display compare R
 
 Con il client collegato, l'indicatore rosso **REC sul device** segue lo stato del pulsante fisico. Il comando STATUS recupera anche lo stato quando il client si collega a una registrazione già avviata.
 
-Premi **COLLEGA** nel gruppo Ricevitore per collegare l'RX e passare alla vista live. Il pulsante **REGISTRAZIONI**, nello stesso gruppo, scarica tutte le registrazioni del Pico e apre l'elenco dei CSV sul PC per scegliere quello da visualizzare. Se REC è attivo, il download richiesto attende la fine della registrazione. Il client confronta dimensione e checksum con le copie locali e scarica solo registrazioni nuove o cambiate. Nel gruppo **Sessioni lanciate da PC**, il pulsante **SESSIONI** apre i GPX salvati nella cartella sessioni.
+Premi **Connetti** nel gruppo Ricevitore per collegare l'RX e passare alla vista live. Il pulsante **REGISTRAZIONI**, nello stesso gruppo, scarica tutte le registrazioni del Pico e apre l'elenco dei CSV sul PC per scegliere quello da visualizzare. Se REC è attivo, il download richiesto attende la fine della registrazione. Il client confronta dimensione e checksum con le copie locali e scarica solo registrazioni nuove o cambiate. Nel gruppo **Sessioni lanciate da PC**, il pulsante **SESSIONI** apre i GPX salvati nella cartella sessioni.
 
 La cartella `Registrazioni` contiene i CSV originali scaricati. Quando apri una registrazione, il client genera gli export GPX e SVG e mostra la mappa interna. Il client verifica dimensione e checksum quando supportato dal firmware e ripete fino a tre volte i trasferimenti non validi. I trasferimenti interrotti restano come file `.part` e possono essere ripetuti.
 
@@ -117,3 +119,7 @@ Sessioni e registrazioni sono salvate accanto al client anche quando il programm
 | `Registrazioni/` | CSV scaricati dal Pico ed export associati |
 
 Le cartelle dei dati, i log e gli ambienti Python locali sono esclusi da Git tramite il `.gitignore` del progetto.
+
+Le registrazioni RX aggiornate includono righe GPS autonome ogni secondo, con `record_type=gps`, e righe dei pacchetti con `record_type=radio`. La mappa rimane consultabile anche quando una sessione contiene soltanto GPS. I tratti senza misure radio vicine sono grigi. I CSV delle versioni precedenti restano leggibili.
+
+Il pulsante **Connetti** diventa **Disconnetti** quando la porta è aperta. Disconnettendo, la sessione PC eventualmente attiva viene salvata. Se il cavo USB viene rimosso, il client chiude la connessione e mostra un avviso nella barra di stato; puoi ricollegarlo e premere **Connetti**. La registrazione autonoma sul Pico continua indipendentemente dalla connessione al PC.
