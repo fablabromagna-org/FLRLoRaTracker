@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <RadioLib.h>
 #include <TinyGPSPlus.h>
+#include <LittleFS.h>
 #include <pico/time.h>
 
 // Set true on the transmitter and false on the receiver.
@@ -21,11 +22,25 @@ const char* const gpsLabels[] = {"no_data", "no_fix", "fix", "unknown"};
 TinyGPSPlus gps;
 auto& gpsSerial = kTransmitter ? Serial2 : Serial1;
 constexpr uint8_t kPpsPin = 16;
+constexpr uint8_t kLogButtonPin = 17;
+constexpr char kCsvHeader[] = "rx_ms,seq,rssi_dbm,snr_db,quality_0_9,gps,lat,lon,distance_m,rx_lat,rx_lon,rx_altitude_m";
+File sessionLog;
+bool storageReady = false;
+bool logError = false;
+uint32_t lastLogFlushMs = 0;
 volatile uint32_t ppsCount = 0;
 bool gpsSeen = false;
 uint32_t lastNmeaMs = 0;
 uint32_t lastRxMs = 0;
 bool linkActive = false;
+bool hasReceivedPacket = false;
+uint32_t lastReceivedSequence = 0;
+uint32_t validPackets = 0;
+uint32_t crcErrors = 0;
+uint32_t invalidPackets = 0;
+uint32_t observedIntervalMs = kIntervalMs;
+uint8_t lastQuality = 0;
+char lastRxMetrics[96] = {};
 
 Adafruit_SSD1306* oled = nullptr;
 
@@ -45,19 +60,29 @@ void showRadioStatus(uint32_t number, const char* status, int16_t error = RADIOL
   oled->clearDisplay();
   oled->setCursor(0, 0);
   oled->setTextSize(2);
-  oled->print(kTransmitter ? "LoRa TX" : "LoRa RX");
-  if (quality) {
-    oled->print(' ');
-    oled->print(quality);
-  }
+  oled->print(kTransmitter ? "LoRa TX" : sessionLog ? "FLR REC" : "FLR RX");
   oled->setCursor(0, 16);
   // Scale down only when the full sequence would exceed the display width.
   const uint8_t numberSize = number < 100000 ? 4 :
                              number < 10000000 ? 3 : 2;
-  oled->setTextSize(quality ? 2 : numberSize);
+  const uint8_t rxNumberSize = number < 100000 ? 2 : 1;
+  oled->setTextSize(kTransmitter ? numberSize : rxNumberSize);
   oled->print(number);
-  oled->setCursor(0, quality ? 32 : 48);
+  if (!kTransmitter) {
+    oled->print("/100");
+    oled->setTextSize(2);
+    oled->setCursor(116, 16);
+    oled->print(quality > 0 ? quality - 1 : 0);
+  }
+  oled->setCursor(0, kTransmitter ? 48 : 32);
   oled->setTextSize(1);
+  if (!kTransmitter) {
+    if (logError) {
+      oled->setCursor(110, 8);
+      oled->print("ERR");
+    }
+    oled->setCursor(0, 32);
+  }
   oled->print(status);
   if (error != RADIOLIB_ERR_NONE) {
     oled->print(' ');
@@ -130,11 +155,128 @@ void setup() {
   if (kTransmitter) {
     lastTxMs = millis() - kIntervalMs;
   } else {
+    pinMode(kLogButtonPin, INPUT_PULLUP);
+    storageReady = LittleFS.begin();
+    logError = !storageReady;
     pinMode(kPpsPin, INPUT_PULLDOWN);
     attachInterrupt(digitalPinToInterrupt(kPpsPin), onPps, RISING);
     radio.setPacketReceivedAction(onPacket);
     checkRadio(radio.startReceive());
     showRadioStatus(0, "Waiting for packets");
+  }
+}
+
+void writeLog(const char* line) {
+  if (sessionLog && sessionLog.println(line) != strlen(line) + 2) {
+    sessionLog.close();
+    logError = true;
+    Serial.println("# log_write_error");
+  }
+}
+
+void pollLogButton() {
+  static bool raw = HIGH;
+  static bool stable = HIGH;
+  static uint32_t changedAt = 0;
+  const bool level = digitalRead(kLogButtonPin);
+  const uint32_t now = millis();
+  if (level != raw) {
+    raw = level;
+    changedAt = now;
+  }
+  if (stable == raw || now - changedAt < 40) {
+    return;
+  }
+  stable = raw;
+  if (stable == HIGH) {
+    return;
+  }
+  if (sessionLog) {
+    sessionLog.close();
+    Serial.println("# log_stopped");
+    showRadioStatus(lastReceivedSequence, "Log saved");
+    return;
+  }
+  if (storageReady) {
+    char path[24];
+    for (unsigned id = 1; id <= 9999; ++id) {
+      snprintf(path, sizeof(path), "/session%04u.csv", id);
+      if (!LittleFS.exists(path)) {
+        sessionLog = LittleFS.open(path, "w");
+        if (sessionLog) {
+          logError = false;
+          writeLog(kCsvHeader);
+          if (sessionLog) {
+            sessionLog.flush();
+            lastLogFlushMs = now;
+            Serial.print("# log_started ");
+            Serial.println(path);
+            showRadioStatus(lastReceivedSequence, "Log started");
+            return;
+          }
+        }
+        break;
+      }
+    }
+  }
+  logError = true;
+  Serial.println("# log_open_error");
+  showRadioStatus(lastReceivedSequence, "Log unavailable");
+}
+
+void pollLogCommands() {
+  static char command[32];
+  static size_t length = 0;
+  static bool overflow = false;
+  while (Serial.available()) {
+    const char ch = Serial.read();
+    if (ch != '\r' && ch != '\n') {
+      if (length < sizeof(command) - 1) {
+        command[length++] = ch;
+      } else {
+        overflow = true;
+      }
+      continue;
+    }
+    command[length] = '\0';
+    if (!overflow && length != 0) {
+      if (strcmp(command, "STATUS") == 0) {
+        Serial.println(sessionLog ? "# recording=1" : "# recording=0");
+      } else if (!storageReady || sessionLog) {
+        Serial.println("# stop recording first or check storage");
+      } else if (strcmp(command, "LIST") == 0) {
+        Dir dir = LittleFS.openDir("/");
+        while (dir.next()) {
+          Serial.print("# ");
+          Serial.print(dir.fileName());
+          Serial.print(' ');
+          Serial.println(dir.fileSize());
+        }
+        Serial.println("# END LIST");
+      } else if (strncmp(command, "GET /session", 12) == 0 &&
+                 strlen(command) == 20 &&
+                 strspn(command + 12, "0123456789") == 4 &&
+                 strcmp(command + 16, ".csv") == 0) {
+        File input = LittleFS.open(command + 4, "r");
+        if (input) {
+          Serial.println("# BEGIN CSV");
+          uint8_t buffer[128];
+          while (Serial && input.available()) {
+            const size_t count = input.read(buffer, sizeof(buffer));
+            if (count == 0 || Serial.write(buffer, count) != count) {
+              break;
+            }
+          }
+          Serial.println("# END CSV");
+        } else {
+          Serial.println("# file not found");
+        }
+      } else {
+        Serial.println("# commands: LIST | GET /session0001.csv");
+      }
+    }
+    length = 0;
+    overflow = false;
   }
 }
 
@@ -186,9 +328,16 @@ void reportRxGps() {
   const uint32_t pulses = ppsCount;
   const GpsStatus status = localGpsStatus();
   if (!linkActive) {
-    char message[40];
-    snprintf(message, sizeof(message), "No recent packets\nRX GPS %s", gpsLabels[status]);
-    showRadioStatus(0, message);
+    char message[64];
+    if (hasReceivedPacket) {
+      snprintf(message, sizeof(message), "No RX for %lu s\nRX GPS %s",
+               static_cast<unsigned long>((now - lastRxMs) / 1000), gpsLabels[status]);
+    } else {
+      snprintf(message, sizeof(message), "Waiting for LoRa\nRX GPS %s", gpsLabels[status]);
+    }
+    showRadioStatus(lastReceivedSequence, message);
+  } else {
+    showRadioStatus(lastReceivedSequence, lastRxMetrics, RADIOLIB_ERR_NONE, lastQuality);
   }
   if (Serial) {
     Serial.print("# rx_gps=");
@@ -235,6 +384,27 @@ void reportRxGps() {
       }
     }
     Serial.println();
+    Serial.print("# rx_radio valid=");
+    Serial.print(validPackets);
+    Serial.print(" crc_errors=");
+    Serial.print(crcErrors);
+    Serial.print(" invalid=");
+    Serial.print(invalidPackets);
+    Serial.print(" last_seq=");
+    Serial.print(lastReceivedSequence);
+    Serial.print(" age_ms=");
+    if (hasReceivedPacket) {
+      Serial.print(now - lastRxMs);
+    } else {
+      Serial.print("none");
+    }
+    Serial.print(" irq=");
+    Serial.print(radio.getIrqFlags(), HEX);
+    Serial.print(" dio1=");
+    Serial.print(digitalRead(20));
+    Serial.print(" interval_ms=");
+    Serial.print(observedIntervalMs);
+    Serial.println();
   }
   previousPpsCount = pulses;
 }
@@ -274,6 +444,50 @@ void transmitPacket() {
   }
 }
 
+void printPacket(Print& output, uint64_t receivedMs, uint32_t receivedSequence,
+                 float rssi, float snr, uint8_t quality, GpsStatus gpsStatus,
+                 double latitude, double longitude, bool hasDistance, double distanceM) {
+  char timestamp[24];
+  snprintf(timestamp, sizeof(timestamp), "%llu",
+           static_cast<unsigned long long>(receivedMs));
+  output.print(timestamp);
+  output.print(',');
+  output.print(receivedSequence);
+  output.print(',');
+  output.print(rssi, 1);
+  output.print(',');
+  output.print(snr, 2);
+  output.print(',');
+  output.print(quality > 0 ? quality - 1 : 0);
+  output.print(',');
+  output.print(gpsLabels[gpsStatus]);
+  output.print(',');
+  if (gpsStatus == Fix) {
+    output.print(latitude, 6);
+  }
+  output.print(',');
+  if (gpsStatus == Fix) {
+    output.print(longitude, 6);
+  }
+  output.print(',');
+  if (hasDistance) {
+    output.print(distanceM, 1);
+  }
+  output.print(',');
+  if (localGpsStatus() == Fix) {
+    output.print(gps.location.lat(), 6);
+    output.print(',');
+    output.print(gps.location.lng(), 6);
+    output.print(',');
+    if (gps.altitude.isValid() && gps.altitude.age() <= kGpsFreshMs) {
+      output.print(gps.altitude.meters(), 1);
+    }
+  } else {
+    output.print(",,");
+  }
+  output.println();
+}
+
 void receivePacket() {
   noInterrupts();
   const bool ready = packetReady;
@@ -291,8 +505,13 @@ void receivePacket() {
   const float snr = radio.getSNR();
   checkRadio(radio.startReceive());
 
+  if (status == RADIOLIB_ERR_CRC_MISMATCH) {
+    ++crcErrors;
+    return;
+  }
   if (status != RADIOLIB_ERR_NONE ||
       (length != kSequenceSize && length != kStatusSize && length != kPositionSize)) {
+    ++invalidPackets;
     return;
   }
 
@@ -303,6 +522,7 @@ void receivePacket() {
     const uint32_t lat = readUint32(payload + 5);
     const uint32_t lon = readUint32(payload + 9);
     if (lat > 180000000 || lon > 360000000) {
+      ++invalidPackets;
       return;
     }
     gpsStatus = Fix;
@@ -311,6 +531,7 @@ void receivePacket() {
   } else if (length == kStatusSize && payload[4] <= NoFix) {
     gpsStatus = static_cast<GpsStatus>(payload[4]);
   } else if (length != kSequenceSize) {
+    ++invalidPackets;
     return;
   }
   const uint32_t receivedSequence = readUint32(payload);
@@ -320,7 +541,19 @@ void receivePacket() {
   const double distanceM = hasDistance
       ? TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), latitude, longitude)
       : 0;
-  lastRxMs = millis();
+  const uint32_t now = millis();
+  if (hasReceivedPacket && receivedSequence == lastReceivedSequence + 1) {
+    const uint32_t interval = now - lastRxMs;
+    // Learn the interval only from consecutive sequences, within five minutes.
+    if (interval > 0 && interval <= 300000) {
+      observedIntervalMs = interval;
+    }
+  }
+  lastRxMs = now;
+  lastReceivedSequence = receivedSequence;
+  hasReceivedPacket = true;
+  ++validPackets;
+  lastQuality = quality;
   linkActive = true;
 
   if (oled) {
@@ -340,39 +573,23 @@ void receivePacket() {
       snprintf(metrics + used, sizeof(metrics) - used, "TX GPS %s\nRX GPS %s",
                gpsLabels[gpsStatus], gpsLabels[rxGpsStatus]);
     }
-    showRadioStatus(receivedSequence, metrics, RADIOLIB_ERR_NONE, quality);
+    snprintf(lastRxMetrics, sizeof(lastRxMetrics), "%s", metrics);
+    showRadioStatus(receivedSequence, lastRxMetrics, RADIOLIB_ERR_NONE, quality);
   }
 
-  if (!Serial) {
-    return;
+  if (sessionLog) {
+    printPacket(sessionLog, receivedMs, receivedSequence, rssi, snr, quality,
+                gpsStatus, latitude, longitude, hasDistance, distanceM);
+    if (sessionLog.getWriteError()) {
+      sessionLog.close();
+      logError = true;
+      Serial.println("# log_write_error");
+    }
   }
-  char timestamp[24];
-  snprintf(timestamp, sizeof(timestamp), "%llu",
-           static_cast<unsigned long long>(receivedMs));
-  Serial.print(timestamp);
-  Serial.print(',');
-  Serial.print(receivedSequence);
-  Serial.print(',');
-  Serial.print(rssi, 1);
-  Serial.print(',');
-  Serial.print(snr, 2);
-  Serial.print(',');
-  Serial.print(quality);
-  Serial.print(',');
-  Serial.print(gpsLabels[gpsStatus]);
-  Serial.print(',');
-  if (gpsStatus == Fix) {
-    Serial.print(latitude, 6);
+  if (Serial) {
+    printPacket(Serial, receivedMs, receivedSequence, rssi, snr, quality,
+                gpsStatus, latitude, longitude, hasDistance, distanceM);
   }
-  Serial.print(',');
-  if (gpsStatus == Fix) {
-    Serial.print(longitude, 6);
-  }
-  Serial.print(',');
-  if (hasDistance) {
-    Serial.print(distanceM, 1);
-  }
-  Serial.println();
 }
 
 void loop() {
@@ -385,11 +602,18 @@ void loop() {
     if (!Serial) {
       headerWritten = false;
     } else if (!headerWritten) {
-      Serial.println("rx_ms,seq,rssi_dbm,snr_db,quality,gps,lat,lon,distance_m");
+      Serial.println(kCsvHeader);
       headerWritten = true;
     }
+    pollLogButton();
+    pollLogCommands();
     receivePacket();
-    if (linkActive && millis() - lastRxMs >= kLinkTimeoutMs) {
+    if (sessionLog && millis() - lastLogFlushMs >= 15000) {
+      sessionLog.flush();
+      lastLogFlushMs = millis();
+    }
+    const uint32_t timeoutMs = max(kLinkTimeoutMs, 3 * observedIntervalMs);
+    if (linkActive && millis() - lastRxMs >= timeoutMs) {
       linkActive = false;
     }
     reportRxGps();

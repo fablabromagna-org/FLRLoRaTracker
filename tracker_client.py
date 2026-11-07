@@ -1,9 +1,20 @@
 import math
+import re
+import time
+import subprocess
+import sys
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree as ET
+
+from tracker_route import save_signal_map
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+SESSIONS_DIR = PROJECT_DIR / "sessioni"
+RECORDINGS_DIR = PROJECT_DIR / "Registrazioni"
 
 
 def coordinates(lat, lon):
@@ -86,13 +97,22 @@ class Client:
         self.root = root
         self.serial = serial
         self.port = self.log = None
+        self.route_viewer = None
         self.state = "idle"
         self.pending = b""
         self.sync_line = True
         self.rx = None
         self.markers = {}
+        self.transfer = None
+        self.transfer_file = None
+        self.device_files = []
+        self.device_recording = None
+        self.wire_scale_nine = False
+        self.segments, self.samples = [[]], []
+        self.last_sample = self.path = self.followed_rx = None
+        self.centered = False
         root.title("TrackerLoRa")
-        root.geometry("1000x700")
+        root.geometry("1280x750")
         toolbar = ttk.Frame(root, padding=8)
         toolbar.pack(fill="x")
         ttk.Label(toolbar, text="COM (115200)").pack(side="left")
@@ -111,8 +131,32 @@ class Client:
             button = ttk.Button(toolbar, text=label, command=action)
             button.pack(side="left", padx=4)
             self.buttons.append(button)
+        ttk.Button(toolbar, text="APRI SESSIONE", command=self.open_session).pack(
+            side="left", padx=4)
+        ttk.Button(toolbar, text="COLLEGA", command=self.connect).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="LEGGI PICO", command=self.list_recordings).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="REGISTRAZIONI", command=self.open_recording).pack(side="left", padx=4)
+        self.rec_label = tk.Label(root, text="REC device · stato sconosciuto",
+                                 font=("Segoe UI", 16, "bold"), anchor="w")
+        self.rec_label.pack(fill="x", padx=10)
         self.status = tk.StringVar()
-        ttk.Label(root, textvariable=self.status, padding=8).pack(fill="x")
+        self.received = tk.StringVar(value="In attesa di pacchetti LoRa")
+        self.sequence = tk.StringVar(value="—")
+        summary = ttk.Frame(root, padding=(10, 4))
+        summary.pack(fill="x")
+        counter = ttk.Frame(summary)
+        counter.pack(side="right")
+        ttk.Label(counter, text="PROGRESSIVO TX", anchor="e").pack(fill="x")
+        ttk.Label(counter, textvariable=self.sequence, anchor="e",
+                  font=("Segoe UI", 38, "bold")).pack(fill="x")
+        details = ttk.Frame(summary)
+        details.pack(side="left", fill="x", expand=True, padx=(0, 16))
+        self.signal_bar = tk.Canvas(details, width=270, height=28, highlightthickness=0)
+        self.signal_bar.pack(anchor="w")
+        self.draw_signal()
+        ttk.Label(details, textvariable=self.received, font=("Segoe UI", 16, "bold"),
+                  justify="left").pack(anchor="w")
+        ttk.Label(root, textvariable=self.status, padding=(10, 4)).pack(fill="x")
         ttk.Label(root, text="Blu: RX e percorso   Rosso: TX   Arancione: pacchetti LoRa"
                            "   |   © OpenStreetMap contributors", padding=8).pack(side="bottom")
         self.map = map_widget(root)
@@ -120,6 +164,16 @@ class Client:
         self.set_state("idle", "Seleziona la porta COM del ricevitore")
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(50, self.poll)
+
+    def draw_signal(self, quality=None):
+        bar = self.signal_bar
+        bar.delete("all")
+        bar.create_rectangle(0, 0, 270, 28, fill="#e5e7eb", outline="")
+        if quality is not None:
+            color = "#4ade80" if quality >= 6 else "#facc15" if quality >= 2 else "#f87171"
+            bar.create_rectangle(0, 0, max(4, 30 * quality), 28, fill=color, outline="")
+        bar.create_text(135, 14, text="—" if quality is None else f"{quality}/9",
+                        fill="#111827", font=("Segoe UI", 14, "bold"))
 
     def set_state(self, state, status):
         self.state = state
@@ -129,6 +183,160 @@ class Client:
         self.ports.configure(state="normal" if state == "idle" else "disabled")
         self.status.set(status)
 
+    def connect(self):
+        if self.port is not None:
+            return
+        try:
+            self.port = self.serial.Serial(self.ports.get().strip(), 115200,
+                                           timeout=0, write_timeout=1)
+            self.port.dtr = True
+            self.pending = b""
+            self.sync_line = True
+            self.port.write(b"STATUS\n")
+            self.status.set("RX collegato")
+        except (OSError, ValueError) as error:
+            if self.port is not None:
+                self.port.close()
+                self.port = None
+            messagebox.showerror("Collegamento RX", str(error))
+
+    def set_rec(self, recording):
+        self.device_recording = recording
+        text = "● REC sul device" if recording else "REC device · fermo"
+        if recording is None:
+            text = "REC device · stato sconosciuto"
+        self.rec_label.configure(text=text, fg="#dc2626" if recording else "#475569")
+
+    def cancel_transfer(self):
+        if self.transfer_file is not None:
+            self.transfer_file.close()
+            self.transfer_file = None
+        self.transfer = None
+
+    def list_recordings(self):
+        if self.transfer:
+            return
+        self.connect()
+        if self.port is None:
+            return
+        if self.device_recording:
+            messagebox.showinfo("Pico", "Premi il pulsante sul device per terminare REC.")
+            return
+        try:
+            self.device_files = []
+            self.port.write(b"LIST\n")
+            self.transfer = "list"
+            self.transfer_deadline = time.monotonic() + 15
+            self.status.set("Lettura elenco registrazioni dal Pico…")
+        except OSError as error:
+            messagebox.showerror("Pico", str(error))
+
+    def choose_device_recording(self):
+        if not self.device_files:
+            messagebox.showinfo("Pico", "Nessuna registrazione presente sul device.")
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Registrazioni sul Pico")
+        files = tk.Listbox(window, width=50, height=12)
+        files.pack(fill="both", expand=True, padx=10, pady=10)
+        for name, size in self.device_files:
+            files.insert("end", f"{name} · {size} byte")
+        files.selection_set(len(self.device_files) - 1)
+
+        def download():
+            selected = files.curselection()
+            if not selected or self.transfer:
+                return
+            name, self.expected_bytes = self.device_files[selected[0]]
+            try:
+                RECORDINGS_DIR.mkdir(exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                self.download_path = RECORDINGS_DIR / f"{stamp}-{name.lstrip('/')}"
+                self.transfer_file = self.download_path.with_suffix(".part").open("xb")
+                self.transfer = "wait"
+                self.transfer_deadline = time.monotonic() + 15
+                self.port.write(f"GET {name}\n".encode("ascii"))
+                window.destroy()
+                self.status.set("Download della registrazione…")
+            except OSError as error:
+                self.cancel_transfer()
+                messagebox.showerror("Pico", str(error))
+
+        ttk.Button(window, text="SCARICA E VISUALIZZA", command=download).pack(pady=10)
+
+    def device_line(self, line):
+        if line.startswith("# log_started") or line == "# recording=1":
+            self.set_rec(True)
+        elif line == "# recording=0":
+            self.set_rec(False)
+        elif line == "# log_stopped":
+            self.set_rec(False)
+            self.root.after(100, self.list_recordings)
+        elif line in ("# log_write_error", "# log_open_error"):
+            self.set_rec(False)
+            self.status.set("Errore di registrazione sul device")
+        if not self.transfer:
+            return False
+        if line in ("# file not found", "# stop recording first or check storage"):
+            self.cancel_transfer()
+            messagebox.showerror("Pico", line.lstrip("# "))
+            return True
+        if self.transfer == "list":
+            match = re.fullmatch(r"# /?(session\d{4}\.csv) (\d+)", line)
+            if match:
+                self.transfer_deadline = time.monotonic() + 15
+                self.device_files.append(("/" + match[1], int(match[2])))
+            if line == "# END LIST":
+                self.transfer = None
+                self.choose_device_recording()
+            return False
+        if line == "# BEGIN CSV" and self.transfer == "wait":
+            self.transfer_deadline = time.monotonic() + 15
+            self.transfer = "csv"
+            return True
+        if self.transfer == "csv":
+            if line == "# END CSV":
+                size = self.transfer_file.tell()
+                self.cancel_transfer()
+                if size != self.expected_bytes:
+                    messagebox.showerror("Pico", "Download incompleto. Il file .part è conservato.")
+                    return True
+                self.download_path.with_suffix(".part").replace(self.download_path)
+                self.show_recording(self.download_path)
+            else:
+                self.transfer_deadline = time.monotonic() + 15
+                self.transfer_file.write((line + "\r\n").encode("ascii"))
+            return True
+        return False
+
+    def open_recording(self):
+        if not RECORDINGS_DIR.exists():
+            messagebox.showinfo("Registrazioni", "Usa LEGGI PICO per scaricare una registrazione.")
+            return
+        filename = filedialog.askopenfilename(
+            parent=self.root, title="Apri registrazione", initialdir=RECORDINGS_DIR,
+            filetypes=[("Registrazione Pico", "*.csv")])
+        if filename:
+            self.show_recording(Path(filename))
+
+    def show_recording(self, filename):
+        from tracker_recordings import read_recording
+        try:
+            segments, samples, has_rx = read_recording(filename)
+            if not samples:
+                messagebox.showinfo("Registrazione", "CSV salvato. Nessuna posizione GPS valida.")
+                return
+            base = filename.with_suffix("")
+            save_route(base, segments, samples)
+            if not has_rx:
+                tree = ET.parse(base.with_suffix(".gpx"))
+                tree.find(".//{*}trk/{*}name").text = "Percorso TX · GPS RX assente nel CSV"
+                tree.write(base.with_suffix(".gpx"), encoding="utf-8", xml_declaration=True)
+            self.launch_route(base.with_suffix(".gpx"))
+            self.status.set(f"Registrazione salvata in Registrazioni/{filename.name}")
+        except (OSError, ValueError, ET.ParseError) as error:
+            messagebox.showerror("Registrazione", str(error))
+
     def start(self):
         if self.state == "idle":
             device = self.ports.get().strip()
@@ -136,10 +344,12 @@ class Client:
                 messagebox.showerror("START", "Seleziona la porta COM del ricevitore")
                 return
             try:
-                self.port = self.serial.Serial(device, 115200, timeout=0)
-                folder = Path(__file__).resolve().parent / "sessioni"
-                folder.mkdir(exist_ok=True)
-                self.base = folder / datetime.now().strftime("giro-%Y%m%d-%H%M%S-%f")
+                if self.port is None:
+                    self.connect()
+                if self.port is None:
+                    return
+                SESSIONS_DIR.mkdir(exist_ok=True)
+                self.base = SESSIONS_DIR / datetime.now().strftime("giro-%Y%m%d-%H%M%S-%f")
                 self.log = self.base.with_suffix(".log").open("xb")
             except (OSError, ValueError) as error:
                 if self.port is not None:
@@ -148,11 +358,15 @@ class Client:
                 messagebox.showerror("START", str(error))
                 return
             self.segments, self.samples = [[]], []
+            self.received.set("In attesa di pacchetti LoRa")
+            self.sequence.set("—")
+            self.draw_signal()
             self.last_sample = None
             self.map.delete_all_marker()
             self.map.delete_all_path()
             self.markers.clear()
             self.centered = False
+            self.followed_rx = None
         else:
             self.segments.append([])
         self.path = None
@@ -168,26 +382,54 @@ class Client:
         if self.state == "idle":
             return True
         try:
-            if self.port is not None:
-                self.port.close()
-                self.port = None
             if self.log is not None:
                 self.log.close()
                 self.log = None
             self.pending = b""
             self.sync_line = True
             save_route(self.base, self.segments, self.samples)
+            save_signal_map(self.base.with_suffix(".gpx"))
         except OSError as error:
             self.buttons[0].configure(state="disabled")
             self.buttons[1].configure(state="disabled")
             self.status.set("Salvataggio incompleto · premi STOP per riprovare")
             messagebox.showerror("STOP", str(error))
             return False
-        self.set_state("idle", f"Sessione salvata · sessioni/{self.base.name} (.log, .gpx, .svg)")
+        self.set_state("idle", f"Sessione salvata · sessioni/{self.base.name} (.log, .gpx, .svg, .html)")
         return True
+
+    def open_session(self):
+        if not SESSIONS_DIR.is_dir():
+            messagebox.showinfo("Apri sessione", "Non ci sono ancora sessioni salvate.")
+            return
+        gpx = filedialog.askopenfilename(
+            parent=self.root, title="Apri sessione TrackerLoRa",
+            initialdir=SESSIONS_DIR, filetypes=[("Sessione TrackerLoRa", "*.gpx")])
+        if not gpx:
+            return
+        self.launch_route(Path(gpx))
+
+    def launch_route(self, gpx):
+        try:
+            save_signal_map(Path(gpx))
+            viewer = subprocess.Popen([
+                sys.executable, str(PROJECT_DIR / "tracker_route.py"), "--serve", str(gpx)])
+        except (OSError, ValueError, ET.ParseError) as error:
+            messagebox.showerror("Apri sessione", str(error))
+            return
+        self.close_route_viewer()
+        self.route_viewer = viewer
+
+    def close_route_viewer(self):
+        if self.route_viewer is not None and self.route_viewer.poll() is None:
+            self.route_viewer.terminate()
 
     def close(self):
         if self.stop():
+            self.cancel_transfer()
+            if self.port is not None:
+                self.port.close()
+            self.close_route_viewer()
             self.root.destroy()
 
     def poll(self):
@@ -202,30 +444,46 @@ class Client:
                     lines = (self.pending + data).split(b"\n")
                     self.pending = lines.pop()
                     for line in lines:
-                        if active and self.sync_line:
-                            self.process(line.decode("ascii", errors="replace").strip())
+                        decoded = line.decode("ascii", errors="replace").strip()
+                        consumed = self.device_line(decoded)
+                        if not consumed and (active or self.state == "idle") and self.sync_line:
+                            self.process(decoded)
                         self.sync_line = True
-                    if self.pending and not active:
+                    if self.pending and self.state == "paused":
                         self.sync_line = False
+            if self.transfer and time.monotonic() > self.transfer_deadline:
+                self.cancel_transfer()
+                messagebox.showerror("Pico", "Trasferimento scaduto. Riprova LEGGI PICO.")
         except OSError as error:
+            self.cancel_transfer()
             self.stop()
+            if self.port is not None:
+                self.port.close()
+                self.port = None
+            self.set_rec(None)
             messagebox.showerror("Lettura RX", str(error))
         finally:
             self.root.after(50, self.poll)
 
-    def marker(self, name, position, color):
+    def marker(self, name, position):
         if name in self.markers:
             self.markers[name].set_position(*position)
         else:
-            self.markers[name] = self.map.set_marker(
-                *position, text=name, marker_color_circle=color, marker_color_outside=color)
+            self.markers[name] = self.map.set_dot(name, position)
         if not self.centered:
             self.map.set_position(*position)
             self.map.set_zoom(15)
             self.centered = True
+        elif name == "RX" and position != self.followed_rx:
+            self.map.set_position(*position)
+        if name == "RX":
+            self.followed_rx = position
 
     def process(self, line):
         now = datetime.now(timezone.utc)
+        if line.startswith("rx_ms,"):
+            self.wire_scale_nine = "quality_0_9" in line
+            return
         if line.startswith("# rx_gps="):
             fields = dict(word.split("=", 1) for word in line.split() if "=" in word)
             try:
@@ -238,7 +496,7 @@ class Client:
                 self.rx = None
                 return
             self.rx = position, altitude, speed, now
-            self.marker("RX", position, "#2563eb")
+            self.marker("RX", position)
             segment = self.segments[-1]
             if not segment or distance(segment[-1][0], position) >= 3:
                 segment.append(self.rx)
@@ -250,20 +508,34 @@ class Client:
             return
 
         fields = line.split(",")
-        if len(fields) != 9:
+        if len(fields) not in (9, 12):
             return
         try:
             int(fields[0])
             sequence, quality = int(fields[1]), int(fields[4])
-            if not 1 <= quality <= 10:
+            if not self.wire_scale_nine:
+                quality = max(0, quality - 1)
+            if not 0 <= quality <= 9:
                 return
             if fields[5] == "fix":
-                self.marker("TX", coordinates(fields[6], fields[7]), "#dc2626")
+                self.marker("TX", coordinates(fields[6], fields[7]))
         except ValueError:
             return
         fresh_rx = self.rx is not None and (now - self.rx[3]).total_seconds() <= 5
-        self.status.set(f"TX #{sequence} · Segnale {quality}/10 · GPS TX: {fields[5]}"
-                        f" · {'GPS RX disponibile' if fresh_rx else 'In attesa di GPS RX'}")
+        try:
+            meters = float(fields[8])
+        except ValueError:
+            meters = math.nan
+        if not math.isfinite(meters) or meters < 0:
+            range_text = "n/d"
+        elif meters >= 1000:
+            range_text = f"{meters / 1000:.2f} km".replace(".", ",")
+        else:
+            range_text = f"{meters:.0f} m"
+        self.sequence.set(f"#{sequence}")
+        self.draw_signal(quality)
+        self.received.set(f"Distanza RX–TX: {range_text}\n"
+                          f"GPS TX: {fields[5]}   ·   GPS RX: {'fix' if fresh_rx else 'in attesa'}")
         if not fresh_rx:
             return
         position, altitude, speed, _ = self.rx
@@ -271,12 +543,10 @@ class Client:
             if (speed is not None and speed < 1) or distance(self.last_sample, position) < 3:
                 return
         height = f"{altitude:.1f} m" if altitude is not None else "n/d"
-        label = f"TX #{sequence} | Segnale {quality}/10 | Altitudine RX {height}"
+        label = f"TX #{sequence} | Segnale {quality}/9 | Altitudine RX {height}"
         self.samples.append(((position, altitude, speed, now), label))
         self.last_sample = position
-        self.map.set_marker(*position, marker_color_circle="#ea580c",
-                            marker_color_outside="#ea580c",
-                            command=lambda _: self.status.set(label))
+        self.map.set_dot("packet", position, command=lambda _: self.status.set(label))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 *.log
 sessioni/
+Registrazioni/
 __pycache__/
 *.py[cod]
 .venv/
